@@ -1,0 +1,2 @@
+# The Agent API is called over raw HTTP (stdlib urllib) — no SDK needed.
+matplotlib>=3.7

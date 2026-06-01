@@ -12,6 +12,7 @@ Ready-to-run applications demonstrating real-world use cases:
 - **[Disease Information App](docs/examples/disease-qa/)** - Interactive medical information lookup
 - **[Financial News Tracker](docs/examples/financial-news-tracker/)** - Real-time market analysis
 - **[Equity Research Brief](docs/examples/equity-research-brief/)** - Agent API + `finance_search` for ticker-level research briefs
+- **[Finance Chart (Sandbox)](docs/examples/finance-chart-sandbox/)** - Agent API + `finance_search` + `sandbox` to chart a stock's price history
 - **[Academic Research Finder](docs/examples/research-finder/)** - Literature discovery and summarization
 - **[Discord Bot](docs/examples/discord-py-bot/)** - Discord integration example
 
