@@ -153,6 +153,15 @@ a.secondary {
   line-height: 1.4;
 }
 
+.chart-img {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin-top: 0.5rem;
+  border-radius: 8px;
+  background: #fff;
+}
+
 .answer-wrap { margin-top: 1.25rem; }
 .answer-wrap h3 {
   margin: 0 0 0.4rem;

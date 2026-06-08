@@ -14,7 +14,7 @@ const viewJsonLink = document.getElementById("view-json");
 const answerWrap = document.getElementById("answer-wrap");
 const answerEl = document.getElementById("answer");
 
-let chart = null;
+const chartImg = document.getElementById("chart");
 let es = null;
 
 function show(el) { el.classList.remove("hidden"); }
@@ -37,33 +37,9 @@ function renderChart(r) {
   hide(statusEl);
   resultTitle.textContent = r.title;
 
-  const ctx = document.getElementById("chart").getContext("2d");
-  if (chart) chart.destroy();
-  chart = new Chart(ctx, {
-    type: "line",
-    data: {
-      labels: r.dates,
-      datasets: [{
-        label: "Close (USD)",
-        data: r.closes,
-        borderColor: "#1f77b4",
-        backgroundColor: "rgba(31,119,180,0.12)",
-        fill: true,
-        pointRadius: 0,
-        borderWidth: 1.8,
-        tension: 0.15,
-      }],
-    },
-    options: {
-      responsive: true,
-      interaction: { mode: "index", intersect: false },
-      plugins: { legend: { display: false } },
-      scales: {
-        x: { ticks: { maxTicksLimit: 10, color: "#9aa0ad" }, grid: { color: "#262a36" } },
-        y: { ticks: { color: "#9aa0ad" }, grid: { color: "#262a36" } },
-      },
-    },
-  });
+  // The chart is the PNG matplotlib rendered inside the sandbox.
+  chartImg.src = r.chart_url;
+  chartImg.alt = r.title;
 
   const cost = r.cost ? `${r.cost.total.toFixed(4)} ${r.cost.currency}` : "—";
   statsEl.innerHTML = "";

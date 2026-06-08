@@ -5,7 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Stock Price Q&A · Perplexity Agent API sandbox</title>
     <link rel="stylesheet" href="styles.css" />
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
   </head>
   <body>
     <main class="container">
@@ -13,8 +12,9 @@
         <h1>Stock Price Q&amp;A</h1>
         <p class="sub">
           Ask in plain English. The Perplexity Agent API <code>sandbox</code>
-          tool figures out the ticker and period, fetches the price history
-          inside an isolated container, and we chart it here.
+          tool figures out the ticker and period, fetches the price history and
+          renders the chart inside an isolated container, and returns it as a
+          downloadable file we show here.
         </p>
       </header>
 
@@ -52,7 +52,7 @@
             <button id="download" type="button" class="secondary">Download CSV</button>
           </div>
         </div>
-        <canvas id="chart" height="120"></canvas>
+        <img id="chart" class="chart-img" alt="Closing-price chart rendered in the sandbox" />
         <div id="answer-wrap" class="answer-wrap hidden">
           <h3>Analysis</h3>
           <p id="answer" class="answer"></p>
