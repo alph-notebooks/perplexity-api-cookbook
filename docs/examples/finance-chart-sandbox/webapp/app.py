@@ -8,7 +8,8 @@ months?"). The backend, using the Perplexity Python SDK, runs a two-phase flow:
   Phase 1 (data)    A *background* Agent API request gives the model the
                     ``sandbox`` tool, which resolves the ticker + period from
                     the question, fetches the daily closing prices inside an
-                    isolated container, and prints a META + ``date,close`` CSV.
+                    isolated container, and **writes them to a CSV file**
+                    (downloaded here) plus a tiny META block on stdout.
   Phase 2 (answer)  A *streaming* request (no sandbox) writes a short
                     natural-language analysis of that series, token by token.
 
@@ -26,7 +27,7 @@ Endpoints:
 Execution runs in a worker thread and writes incremental state onto the job, so
 the SSE stream merely *tails* that state — reconnects never re-run the work.
 
-CSV-extraction/parsing helpers are reused from the CLI module
+CSV parsing and shared-file helpers are reused from the CLI module
 (``finance_chart_sandbox``); only the API call differs (SDK here, raw HTTP there).
 """
 
@@ -59,34 +60,40 @@ JOBS: Dict[str, dict] = {}
 _LOCK = threading.Lock()
 
 DEFAULT_MODEL = "openai/gpt-5.5"
+POLL_TIMEOUT = 300
 META_START = "===META_START==="
 META_END = "===META_END==="
 
-# Phase 1: data-gathering inside the sandbox.
+# Phase 1: data-gathering AND charting inside the sandbox.
 DATA_PROMPT = f"""You answer natural-language questions about a stock's recent
-price history by producing a chart-ready CSV.
+price history by producing a CSV file and a line-chart PNG.
 
-You have the `sandbox` tool — an isolated Python environment that includes the
-`perplexity` SDK (web search and URL fetch) plus pandas and the standard
-library.
+You have the `sandbox` tool — an isolated Python environment with
+`urllib`/`requests`, pandas, matplotlib, the standard library, and a writable
+working directory.
 
-Do this:
-1. Read the user's question and determine the stock TICKER (resolve a company
-   name to its symbol, e.g. "apple" -> AAPL) and the time PERIOD they asked
-   about (default to the last 6 months if none is given).
-2. Use the sandbox to obtain the DAILY closing prices for that ticker over that
-   period: search the web and/or fetch a historical-price page with a clean
-   date/close table. If a source fails or is rate-limited, try another. Never
-   fabricate or interpolate prices — use only values you actually retrieved.
-3. Print to stdout, in exactly this order and nothing else:
+The files `{fcs.CSV_NAME}` and `{fcs.PNG_NAME}` ARE the deliverable; they are
+returned to the caller as downloadable artifacts. The task is complete only
+once both exist. Do this:
+1. Read the question and determine the stock TICKER (resolve a company name to
+   its symbol, e.g. "apple" -> AAPL) and the PERIOD as a Yahoo range token
+   (1mo, 3mo, 6mo, 1y, 2y, 5y; default 6mo).
+2. Fetch the daily closing prices from Yahoo Finance's v8 chart JSON at exactly
+   `https://query1.finance.yahoo.com/v8/finance/chart/<TICKER>?range=<RANGE>&interval=1d`
+   with a browser `User-Agent` header (e.g. `Mozilla/5.0`). Parse
+   `result.timestamp` (epoch) with `result.indicators.quote[0].close`; drop
+   null closes. If it is rate-limited, fall back to the Stooq daily CSV
+   (`https://stooq.com/q/d/l/?s=<ticker>.us&i=d`). Never fabricate prices.
+3. Write `{fcs.CSV_NAME}`: header `date,close`; ascending; dates YYYY-MM-DD;
+   close a plain number.
+4. Render a line chart and save `{fcs.PNG_NAME}` (~10x5in @150dpi; line #1f77b4
+   with a light fill; dashed grid; x-label "Date", y-label "Close (USD)";
+   title "<TICKER> closing price — <label>"; concise date ticks).
+5. Then print to stdout ONLY this routing block (not the prices):
    {META_START}
    ticker: <TICKER>
    label: <short human label, e.g. last 6 months>
-   {META_END}
-   {fcs.CSV_START}
-   date,close
-   <ascending daily rows; dates YYYY-MM-DD; close as a plain number>
-   {fcs.CSV_END}"""
+   {META_END}"""
 
 # Phase 2: the streamed natural-language analysis.
 ANSWER_PROMPT = """You are a concise financial analyst. Given a user's question
@@ -146,7 +153,10 @@ def _run_sandbox(client, query, model, max_steps, poll_timeout) -> dict:
         input=query,
         tools=[{"type": "sandbox"}],
         background=True,
-        max_output_tokens=4096,
+        # Generous headroom: the sandbox spends output tokens writing the code
+        # that fetches the data and writes the file; a tight cap can starve the
+        # final write step.
+        max_output_tokens=8192,
         max_steps=max_steps,
     )
     deadline = time.time() + poll_timeout
@@ -158,10 +168,22 @@ def _run_sandbox(client, query, model, max_steps, poll_timeout) -> dict:
     return _to_dict(response)
 
 
+def _sandbox_stdout(response: dict) -> str:
+    """Concatenate stdout from every sandbox execution result (for the META block)."""
+    chunks: List[str] = []
+    for item in response.get("output", []) or []:
+        if item.get("type") != "sandbox_results":
+            continue
+        for res in item.get("results", []) or []:
+            if res.get("stdout"):
+                chunks.append(res["stdout"])
+    return "\n".join(chunks)
+
+
 def _parse_meta(response: dict) -> Dict[str, str]:
-    haystack = fcs._sandbox_stdout(response) + "\n" + fcs._message_text(response)
     block = re.search(
-        re.escape(META_START) + r"\s*(.*?)\s*" + re.escape(META_END), haystack, re.S
+        re.escape(META_START) + r"\s*(.*?)\s*" + re.escape(META_END),
+        _sandbox_stdout(response), re.S,
     )
     meta: Dict[str, str] = {}
     if block:
@@ -172,8 +194,18 @@ def _parse_meta(response: dict) -> Dict[str, str]:
     return meta
 
 
+def _base_url() -> str:
+    return os.environ.get("PERPLEXITY_BASE_URL", fcs.DEFAULT_BASE_URL)
+
+
 def _fetch_data(client, query, attempts, max_steps, poll_timeout, on_attempt):
-    """Retry phase 1 until a usable CSV parses."""
+    """Retry phase 1 until the sandbox shares a usable CSV file and a chart PNG.
+
+    Returns ``(dates, closes, csv_text, png_bytes, meta, response)``. The CSV is
+    parsed here both to validate it and to feed the phase-2 analysis; the PNG is
+    the chart the sandbox rendered.
+    """
+    base_url, key = _base_url(), fcs.resolve_api_key()
     for attempt in range(1, attempts + 1):
         on_attempt(attempt, attempts, None)
         try:
@@ -184,16 +216,20 @@ def _fetch_data(client, query, attempts, max_steps, poll_timeout, on_attempt):
         if response.get("status") == "failed":
             on_attempt(attempt, attempts, f"request failed: {response.get('error')}")
             continue
-        candidate = fcs.extract_csv(response)
-        if not candidate:
-            on_attempt(attempt, attempts, "no fenced CSV in output")
+        files = fcs.shared_files(response, base_url, key)
+        csv_file, png_file = fcs.pick_file(files, ".csv"), fcs.pick_file(files, ".png")
+        if not csv_file or not png_file:
+            have = ", ".join(f.get("filename", "?") for f in files) or "none"
+            on_attempt(attempt, attempts, f"missing CSV/PNG (got: {have})")
             continue
         try:
+            candidate = fcs._download(base_url, key, csv_file["url"]).decode("utf-8", "replace")
+            png_bytes = fcs._download(base_url, key, png_file["url"])
             dates, closes = fcs.parse_csv(candidate)
-        except RuntimeError as err:
-            on_attempt(attempt, attempts, f"unusable CSV: {err}")
+        except (OSError, RuntimeError, TimeoutError) as err:
+            on_attempt(attempt, attempts, f"unusable CSV/PNG: {err}")
             continue
-        return dates, closes, candidate, _parse_meta(response), response
+        return dates, closes, candidate, png_bytes, _parse_meta(response), response
     raise RuntimeError(
         f"Could not answer the query from the sandbox after {attempts} "
         "attempt(s). Data fetching is best-effort (sources rate-limit); "
@@ -249,8 +285,9 @@ def _run_job(job_id: str) -> None:
         _push(job_id, {"kind": "progress", "message": msg})
 
     try:
-        dates, closes, csv_text, meta, response = _fetch_data(
-            client, query, attempts, max_steps, poll_timeout=300, on_attempt=on_attempt
+        dates, closes, csv_text, png_bytes, meta, response = _fetch_data(
+            client, query, attempts, max_steps, poll_timeout=POLL_TIMEOUT,
+            on_attempt=on_attempt,
         )
     except (RuntimeError, TimeoutError) as err:
         _set(job_id, status="error", error=str(err))
@@ -267,13 +304,14 @@ def _run_job(job_id: str) -> None:
         "points": len(dates),
         "first_date": dates[0].strftime("%Y-%m-%d"),
         "last_date": dates[-1].strftime("%Y-%m-%d"),
-        "dates": [d.strftime("%Y-%m-%d") for d in dates],
-        "closes": closes,
+        # The chart is the PNG the sandbox rendered, served at /chart.png.
+        "chart_url": f"/api/charts/{job_id}/chart.png",
         "sandbox_invocations": fcs.sandbox_invocations(response),
         "cost": ({"total": cost[0], "currency": cost[1]} if cost else None),
     }
     filename = ((ticker or "chart") + "_" + re.sub(r"[^\w]+", "-", label)).strip("-")
-    _set(job_id, csv=csv_text, filename=filename, response=response, result=result)
+    _set(job_id, csv=csv_text, png=png_bytes, filename=filename,
+         response=response, result=result)
     _push(job_id, {"kind": "chart", "result": result})
 
     # Phase 2: stream the natural-language analysis.
@@ -302,7 +340,7 @@ def create_chart(req: ChartRequest) -> dict:
             "status": "queued", "query": req.query.strip(),
             "attempts": req.attempts, "max_steps": req.max_steps,
             "events": [], "answer": "", "result": None, "csv": None,
-            "filename": "chart", "response": None, "error": None,
+            "png": None, "filename": "chart", "response": None, "error": None,
         }
     threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
     return {"job_id": job_id, "status": "queued"}
@@ -382,6 +420,17 @@ def get_csv(job_id: str) -> PlainTextResponse:
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{job["filename"]}.csv"'},
     )
+
+
+@app.get("/api/charts/{job_id}/chart.png")
+def get_chart_png(job_id: str) -> Response:
+    """The chart PNG the sandbox rendered (downloaded in phase 1)."""
+    with _LOCK:
+        job = JOBS.get(job_id)
+        png = job["png"] if job else None
+    if not png:
+        raise HTTPException(status_code=404, detail="No chart for this job")
+    return Response(png, media_type="image/png")
 
 
 # Serve the static frontend at the root. Mounted last so /api/* takes priority.
